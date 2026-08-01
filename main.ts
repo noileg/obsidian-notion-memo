@@ -194,6 +194,11 @@ export default class NotionMemoPlugin extends Plugin {
 				if (file) this.pushNote(file);
 			},
 		});
+		this.addCommand({
+			id: "notion-memo-push-all",
+			name: "vault内のすべてのメモをNotionへ送信する（プラグイン導入前からあったものも含む）",
+			callback: () => this.pushAll(),
+		});
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
@@ -231,6 +236,29 @@ export default class NotionMemoPlugin extends Plugin {
 			});
 		}, PUSH_DEBOUNCE_MS);
 		this.pendingPush.set(file.path, timer);
+	}
+
+	async pushAll() {
+		if (!this.settings.notionToken) {
+			new Notice("Notionのトークンが未設定です（設定タブから入力してください）");
+			return;
+		}
+
+		const files = this.app.vault.getMarkdownFiles();
+		let sent = 0;
+		let failed = 0;
+		for (const file of files) {
+			try {
+				await this.pushNote(file);
+				sent++;
+			} catch (err) {
+				console.error("[notion-memo] 一括送信中に失敗", file.path, err);
+				failed++;
+			}
+			// Notion APIのレート制限（目安: 秒間数リクエスト）に配慮して少し間を空ける
+			await new Promise((resolve) => window.setTimeout(resolve, 400));
+		}
+		new Notice(`一括送信完了: ${sent}件（失敗${failed}件）`);
 	}
 
 	async pushNote(file: TFile) {
@@ -364,6 +392,16 @@ class NotionMemoSettingTab extends PluginSettingTab {
 					this.plugin.settings.autoSyncOnSave = value;
 					await this.plugin.saveSettings();
 				})
+			);
+
+		new Setting(containerEl)
+			.setName("既存メモを一括送信")
+			.setDesc(
+				"プラグイン導入前から vault にあったメモは、編集イベントが起きるまで自動送信されない。" +
+					"導入直後に一度これを押すと、vault内の全メモをまとめて送信する。"
+			)
+			.addButton((button) =>
+				button.setButtonText("すべて送信").onClick(() => this.plugin.pushAll())
 			);
 
 		new Setting(containerEl)
