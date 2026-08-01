@@ -1,0 +1,9 @@
+{
+	"id": "obsidian-notion-memo",
+	"name": "Notion Memo Sync",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "AIが介在しないメモを、専用のNotionページと双方向に同期する。",
+	"author": "noileg",
+	"isDesktopOnly": false
+}
