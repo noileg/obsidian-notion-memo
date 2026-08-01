@@ -230,6 +230,14 @@ export default class NotionMemoPlugin extends Plugin {
 				)
 			);
 		}
+
+		// モバイルはバックグラウンドでタイマーが動かないため、間隔設定より
+		// 「アプリを開いた瞬間」の方が実質効く。起動のたびに1回pullする。
+		if (this.settings.notionToken) {
+			this.pullFromNotion().catch((err) => {
+				console.error("[notion-memo] 起動時pull失敗", err);
+			});
+		}
 	}
 
 	onunload() {
