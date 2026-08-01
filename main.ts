@@ -20,6 +20,7 @@ interface NotionMemoSettings {
 	parentPageId: string;
 	notionVersion: string;
 	autoSyncOnSave: boolean;
+	autoPullMinutes: number; // 0で自動pullなし
 }
 
 const DEFAULT_SETTINGS: NotionMemoSettings = {
@@ -28,6 +29,7 @@ const DEFAULT_SETTINGS: NotionMemoSettings = {
 	parentPageId: "3ea66ce3-d0b2-4b15-a01b-0dafd9e35cac",
 	notionVersion: "2026-03-11",
 	autoSyncOnSave: true,
+	autoPullMinutes: 5,
 };
 
 const FRONTMATTER_ID_KEY = "notion_id";
@@ -52,6 +54,15 @@ function stripFrontmatter(content: string): string {
 	if (end === -1) return content;
 	const after = content.indexOf("\n", end + 1);
 	return after === -1 ? "" : content.slice(after + 1);
+}
+
+/** フロントマター部分（`---`〜`---`とその直後の改行まで）だけを取り出す。無ければ空文字。 */
+function frontmatterBlockOf(content: string): string {
+	if (!content.startsWith("---\n")) return "";
+	const end = content.indexOf("\n---", 4);
+	if (end === -1) return "";
+	const after = content.indexOf("\n", end + 1);
+	return after === -1 ? content : content.slice(0, after + 1);
 }
 
 function splitParagraphs(text: string): string[] {
@@ -176,6 +187,9 @@ class NotionClient {
 export default class NotionMemoPlugin extends Plugin {
 	settings!: NotionMemoSettings;
 	private pendingPush = new Map<string, number>();
+	// pull側が書いたファイルパス。自動push側の'modify'リスナーが、
+	// pullの書き込みを人間の編集と誤認して即座に押し返すのを防ぐガード。
+	private selfWritten = new Set<string>();
 
 	async onload() {
 		await this.loadSettings();
@@ -202,11 +216,20 @@ export default class NotionMemoPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
-				if (this.settings.autoSyncOnSave && file instanceof TFile && file.extension === "md") {
-					this.schedulePush(file);
-				}
+				if (!(file instanceof TFile) || file.extension !== "md") return;
+				if (this.selfWritten.has(file.path)) return; // pull自身の書き込みは無視
+				if (this.settings.autoSyncOnSave) this.schedulePush(file);
 			})
 		);
+
+		if (this.settings.autoPullMinutes > 0) {
+			this.registerInterval(
+				window.setInterval(
+					() => this.pullFromNotion(),
+					this.settings.autoPullMinutes * 60 * 1000
+				)
+			);
+		}
 	}
 
 	onunload() {
@@ -223,6 +246,12 @@ export default class NotionMemoPlugin extends Plugin {
 
 	private client(): NotionClient {
 		return new NotionClient(this.settings.notionToken, this.settings.notionVersion);
+	}
+
+	private markSelfWritten(path: string) {
+		this.selfWritten.add(path);
+		// 'modify'イベントの発火・購読側の処理が終わるのに十分な猶予を置いてから解除する。
+		window.setTimeout(() => this.selfWritten.delete(path), PUSH_DEBOUNCE_MS + 1000);
 	}
 
 	private schedulePush(file: TFile) {
@@ -318,6 +347,7 @@ export default class NotionMemoPlugin extends Plugin {
 				const hash = hashString(body);
 				const filename = `${sanitizeFilename(child.title)}.md`;
 				const newFile = await this.app.vault.create(filename, body);
+				this.markSelfWritten(newFile.path);
 				await this.app.fileManager.processFrontMatter(newFile, (data) => {
 					data[FRONTMATTER_ID_KEY] = child.id;
 					data[FRONTMATTER_HASH_KEY] = hash;
@@ -335,11 +365,18 @@ export default class NotionMemoPlugin extends Plugin {
 			const hash = hashString(body);
 			if (localCache?.[FRONTMATTER_HASH_KEY] === hash) continue; // 中身は同じ
 
-			await this.app.vault.modify(local, body);
+			this.markSelfWritten(local.path);
+			// 先にフロントマターだけ更新（notion_idはここでは触らないので保持される）。
+			// 本文の差し替えは、そのフロントマターを含めた全文を組み直してから行う
+			// ——vault.modifyは全文置換であり、本文だけを渡すとフロントマター
+			// （notion_id含む）が消えるバグがあったため、この順序にしている。
 			await this.app.fileManager.processFrontMatter(local, (data) => {
 				data[FRONTMATTER_HASH_KEY] = hash;
 				data[FRONTMATTER_PULLED_AT_KEY] = lastEdited;
 			});
+			const updatedRaw = await this.app.vault.read(local);
+			const fmBlock = frontmatterBlockOf(updatedRaw);
+			await this.app.vault.modify(local, fmBlock + body);
 			updated++;
 		}
 
@@ -392,6 +429,19 @@ class NotionMemoSettingTab extends PluginSettingTab {
 					this.plugin.settings.autoSyncOnSave = value;
 					await this.plugin.saveSettings();
 				})
+			);
+
+		new Setting(containerEl)
+			.setName("Notionから自動で取り込む間隔（分）")
+			.setDesc("0にすると自動では取り込まず、手動同期のみになる。変更はObsidianの再読み込み後に反映")
+			.addText((text) =>
+				text
+					.setValue(String(this.plugin.settings.autoPullMinutes))
+					.onChange(async (value) => {
+						const n = Number(value);
+						this.plugin.settings.autoPullMinutes = Number.isFinite(n) && n >= 0 ? n : 0;
+						await this.plugin.saveSettings();
+					})
 			);
 
 		new Setting(containerEl)
