@@ -579,6 +579,21 @@ export default class NotionMemoPlugin extends Plugin {
 			});
 			new Notice(`Notionへ新規作成: ${file.basename}`);
 		} else {
+			// 競合検知：前回同期時点からNotion側が別に変わっていないか確認する。
+			// 確認せず上書きすると、Notion側での直接編集がここで消える
+			// （このメモがまさに踏んだ不具合）。
+			const knownHash = fm?.[FRONTMATTER_HASH_KEY];
+			if (knownHash) {
+				const remoteBody = await client.getPageMarkdown(notionId);
+				const remoteHash = hashString(remoteBody);
+				if (remoteHash !== knownHash) {
+					new Notice(
+						`Notion側が別に更新されているため送信を中止: ${file.basename}` +
+							"（先に「Notionから同期する」を実行してください）"
+					);
+					return;
+				}
+			}
 			await client.updatePageContent(notionId, file.basename, body);
 			await this.app.fileManager.processFrontMatter(file, (data) => {
 				data[FRONTMATTER_HASH_KEY] = hash;
@@ -629,9 +644,17 @@ export default class NotionMemoPlugin extends Plugin {
 			const pulledAt = localCache?.[FRONTMATTER_PULLED_AT_KEY];
 			if (pulledAt && pulledAt >= lastEdited) continue; // ローカルの方が新しいか同じ
 
+			// 競合検知：ローカルに、まだNotionへ送信していない編集が残っていないか確認する。
+			// 確認せず上書きすると、debounce待ちの間にpullが割り込んでローカルの
+			// 編集を消してしまう（これがまさに踏んだ不具合）。
+			const knownHash = localCache?.[FRONTMATTER_HASH_KEY];
+			const currentLocalRaw = await this.app.vault.read(local);
+			const currentLocalHash = hashString(stripFrontmatter(currentLocalRaw).trim());
+			if (knownHash && currentLocalHash !== knownHash) continue; // 未送信の編集があるので今回は触らない
+
 			const body = await client.getPageMarkdown(child.id);
 			const hash = hashString(body);
-			if (localCache?.[FRONTMATTER_HASH_KEY] === hash) continue; // 中身は同じ
+			if (knownHash === hash) continue; // 中身は同じ
 
 			this.markSelfWritten(local.path);
 			// 先にフロントマターだけ更新（notion_idはここでは触らないので保持される）。
