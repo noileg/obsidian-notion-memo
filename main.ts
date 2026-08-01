@@ -11,8 +11,10 @@ import {
 /**
  * このvault全体を「AIが介在しないメモ」専用として扱う前提の設計。
  * フォルダによる絞り込みはしない（vault自体を分けることで対象を絞る運用のため）。
- * Notion側のメモは1子ページ=1本文（段落単位のプレーンテキスト）として扱い、
- * リッチな書式の相互変換は持たない（cf. croco/notion.pyのparagraph_blocks）。
+ * Notion側のメモは1子ページ=1本文として扱う。Markdownの見出し・リスト・
+ * チェックボックス・引用・コードブロックと、太字/斜体/インラインコードの
+ * 範囲装飾はNotionのブロック種別・rich_text annotationsに変換する
+ * （それ以外の書式・ネストは今のところ対象外）。
  */
 
 interface NotionMemoSettings {
@@ -65,23 +67,282 @@ function frontmatterBlockOf(content: string): string {
 	return after === -1 ? content : content.slice(0, after + 1);
 }
 
-function splitParagraphs(text: string): string[] {
-	return text
-		.split(/\n{2,}/)
-		.map((p) => p.trim())
-		.filter((p) => p.length > 0);
-}
-
-function chunkRichText(text: string): { type: "text"; text: { content: string } }[] {
-	const chunks: { type: "text"; text: { content: string } }[] = [];
-	for (let i = 0; i < text.length; i += RICH_TEXT_LIMIT) {
-		chunks.push({ type: "text", text: { content: text.slice(i, i + RICH_TEXT_LIMIT) } });
-	}
-	return chunks.length > 0 ? chunks : [{ type: "text", text: { content: "" } }];
-}
-
 function sanitizeFilename(title: string): string {
 	return title.replace(/[\\/:*?"<>|]/g, "_").trim() || "無題";
+}
+
+// --- インライン装飾（太字/斜体/コード）の相互変換 ---------------------------
+
+interface RichTextRun {
+	text: string;
+	annotations: { bold?: boolean; italic?: boolean; code?: boolean };
+}
+
+/** `**太字**` `*斜体*`/`_斜体_` `` `コード` `` を区間ごとのrunに分解する。ネストは扱わない。 */
+function parseInline(text: string): RichTextRun[] {
+	const runs: RichTextRun[] = [];
+	let buffer = "";
+	let i = 0;
+	const flush = () => {
+		if (buffer) runs.push({ text: buffer, annotations: {} });
+		buffer = "";
+	};
+	while (i < text.length) {
+		if (text.startsWith("**", i)) {
+			const end = text.indexOf("**", i + 2);
+			if (end !== -1) {
+				flush();
+				runs.push({ text: text.slice(i + 2, end), annotations: { bold: true } });
+				i = end + 2;
+				continue;
+			}
+		} else if (text[i] === "`") {
+			const end = text.indexOf("`", i + 1);
+			if (end !== -1) {
+				flush();
+				runs.push({ text: text.slice(i + 1, end), annotations: { code: true } });
+				i = end + 1;
+				continue;
+			}
+		} else if ((text[i] === "*" || text[i] === "_") && text[i + 1] !== " " && text[i + 1] !== undefined) {
+			const marker = text[i];
+			const end = text.indexOf(marker, i + 1);
+			if (end !== -1 && end > i + 1) {
+				flush();
+				runs.push({ text: text.slice(i + 1, end), annotations: { italic: true } });
+				i = end + 1;
+				continue;
+			}
+		}
+		buffer += text[i];
+		i++;
+	}
+	flush();
+	return runs.length > 0 ? runs : [{ text: "", annotations: {} }];
+}
+
+function runsToRichText(runs: RichTextRun[]): unknown[] {
+	const out: unknown[] = [];
+	for (const run of runs) {
+		const makeItem = (chunk: string): Record<string, unknown> => {
+			const item: Record<string, unknown> = { type: "text", text: { content: chunk } };
+			if (Object.keys(run.annotations).length > 0) item.annotations = run.annotations;
+			return item;
+		};
+		if (run.text.length === 0) {
+			out.push(makeItem(""));
+			continue;
+		}
+		for (let i = 0; i < run.text.length; i += RICH_TEXT_LIMIT) {
+			out.push(makeItem(run.text.slice(i, i + RICH_TEXT_LIMIT)));
+		}
+	}
+	return out.length > 0 ? out : [{ type: "text", text: { content: "" } }];
+}
+
+function richTextToMarkdown(richText: any[] | undefined): string {
+	return (richText ?? [])
+		.map((rt: any) => {
+			let s: string = rt.plain_text ?? "";
+			const a = rt.annotations ?? {};
+			if (a.code) s = `\`${s}\``;
+			if (a.bold) s = `**${s}**`;
+			if (a.italic) s = `*${s}*`;
+			return s;
+		})
+		.join("");
+}
+
+// --- ブロック単位（見出し/リスト/チェックボックス/引用/コード/段落）の相互変換 ---
+
+type Block =
+	| { kind: "heading_1" | "heading_2" | "heading_3"; text: string }
+	| { kind: "bulleted_list_item" | "numbered_list_item"; text: string }
+	| { kind: "to_do"; text: string; checked: boolean }
+	| { kind: "quote"; text: string }
+	| { kind: "code"; text: string; language: string }
+	| { kind: "paragraph"; text: string };
+
+/** Markdown本文を行単位で解釈し、Notionのブロック種別に対応するBlock列に変換する。 */
+function linesToBlocks(text: string): Block[] {
+	const lines = text.split("\n");
+	const blocks: Block[] = [];
+	let paragraphBuffer: string[] = [];
+	const flushParagraph = () => {
+		if (paragraphBuffer.length > 0) {
+			blocks.push({ kind: "paragraph", text: paragraphBuffer.join("\n") });
+			paragraphBuffer = [];
+		}
+	};
+
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i];
+		const trimmed = line.trim();
+
+		if (trimmed === "") {
+			flushParagraph();
+			i++;
+			continue;
+		}
+
+		const codeFence = trimmed.match(/^```(\S*)\s*$/);
+		if (codeFence) {
+			flushParagraph();
+			const language = codeFence[1] || "plain text";
+			const codeLines: string[] = [];
+			i++;
+			while (i < lines.length && lines[i].trim() !== "```") {
+				codeLines.push(lines[i]);
+				i++;
+			}
+			i++; // 閉じの```を読み飛ばす（無くても末尾扱いで抜ける）
+			blocks.push({ kind: "code", text: codeLines.join("\n"), language });
+			continue;
+		}
+
+		const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
+		if (heading) {
+			flushParagraph();
+			const level = Math.min(heading[1].length, 3);
+			blocks.push({ kind: `heading_${level}` as "heading_1" | "heading_2" | "heading_3", text: heading[2] });
+			i++;
+			continue;
+		}
+
+		const todo = trimmed.match(/^[-*]\s+\[([ xX])\]\s+(.*)$/);
+		if (todo) {
+			flushParagraph();
+			blocks.push({ kind: "to_do", text: todo[2], checked: todo[1].toLowerCase() === "x" });
+			i++;
+			continue;
+		}
+
+		const bullet = trimmed.match(/^[-*]\s+(.*)$/);
+		if (bullet) {
+			flushParagraph();
+			blocks.push({ kind: "bulleted_list_item", text: bullet[1] });
+			i++;
+			continue;
+		}
+
+		const numbered = trimmed.match(/^\d+\.\s+(.*)$/);
+		if (numbered) {
+			flushParagraph();
+			blocks.push({ kind: "numbered_list_item", text: numbered[1] });
+			i++;
+			continue;
+		}
+
+		const quote = trimmed.match(/^>\s?(.*)$/);
+		if (quote) {
+			flushParagraph();
+			blocks.push({ kind: "quote", text: quote[1] });
+			i++;
+			continue;
+		}
+
+		paragraphBuffer.push(line);
+		i++;
+	}
+	flushParagraph();
+	return blocks;
+}
+
+function blockToNotionPayload(block: Block): Record<string, unknown> {
+	if (block.kind === "code") {
+		return {
+			object: "block",
+			type: "code",
+			code: {
+				rich_text: runsToRichText([{ text: block.text, annotations: {} }]),
+				language: block.language,
+			},
+		};
+	}
+	const richText = runsToRichText(parseInline(block.text));
+	switch (block.kind) {
+		case "heading_1":
+		case "heading_2":
+		case "heading_3":
+			return { object: "block", type: block.kind, [block.kind]: { rich_text: richText } };
+		case "bulleted_list_item":
+			return { object: "block", type: "bulleted_list_item", bulleted_list_item: { rich_text: richText } };
+		case "numbered_list_item":
+			return { object: "block", type: "numbered_list_item", numbered_list_item: { rich_text: richText } };
+		case "to_do":
+			return {
+				object: "block",
+				type: "to_do",
+				to_do: { rich_text: richText, checked: block.checked },
+			};
+		case "quote":
+			return { object: "block", type: "quote", quote: { rich_text: richText } };
+		case "paragraph":
+		default:
+			return { object: "block", type: "paragraph", paragraph: { rich_text: richText } };
+	}
+}
+
+function bodyToNotionBlocks(text: string): Record<string, unknown>[] {
+	return linesToBlocks(text).map(blockToNotionPayload);
+}
+
+/** Notionのブロック列（APIレスポンス）をMarkdown本文に戻す。 */
+function blocksToMarkdown(blocks: any[]): string {
+	const lines: string[] = [];
+	let prevType: string | null = null;
+	let numberedIndex = 0; // numbered_list_itemが連続する間だけ増える連番
+
+	// 空行を挟まずに連続してよい種別（リスト系）。異なる種別の並びは
+	// 視覚的に区切るため空行を挟む。
+	const listLikeTypes = new Set(["bulleted_list_item", "numbered_list_item", "to_do"]);
+
+	for (const block of blocks) {
+		const type: string = block.type;
+		let line: string;
+		switch (type) {
+			case "heading_1":
+				line = "# " + richTextToMarkdown(block.heading_1?.rich_text);
+				break;
+			case "heading_2":
+				line = "## " + richTextToMarkdown(block.heading_2?.rich_text);
+				break;
+			case "heading_3":
+				line = "### " + richTextToMarkdown(block.heading_3?.rich_text);
+				break;
+			case "bulleted_list_item":
+				line = "- " + richTextToMarkdown(block.bulleted_list_item?.rich_text);
+				break;
+			case "numbered_list_item":
+				numberedIndex = prevType === "numbered_list_item" ? numberedIndex + 1 : 1;
+				line = `${numberedIndex}. ` + richTextToMarkdown(block.numbered_list_item?.rich_text);
+				break;
+			case "to_do":
+				line = `- [${block.to_do?.checked ? "x" : " "}] ` + richTextToMarkdown(block.to_do?.rich_text);
+				break;
+			case "quote":
+				line = "> " + richTextToMarkdown(block.quote?.rich_text);
+				break;
+			case "code": {
+				const lang = block.code?.language ?? "";
+				const body = richTextToMarkdown(block.code?.rich_text);
+				line = "```" + lang + "\n" + body + "\n```";
+				break;
+			}
+			case "paragraph":
+			default:
+				line = richTextToMarkdown(block.paragraph?.rich_text ?? []);
+				break;
+		}
+
+		const continuesList = listLikeTypes.has(type) && prevType === type;
+		if (lines.length > 0 && !continuesList) lines.push("");
+		lines.push(line);
+		prevType = type;
+	}
+
+	return lines.join("\n");
 }
 
 class NotionClient {
@@ -125,31 +386,16 @@ class NotionClient {
 		return this.call("GET", `/pages/${pageId}`);
 	}
 
-	async getPageParagraphs(pageId: string): Promise<string> {
-		const paragraphs: string[] = [];
+	async getPageMarkdown(pageId: string): Promise<string> {
+		const blocks: any[] = [];
 		let cursor: string | undefined;
 		do {
 			const qs = cursor ? `?start_cursor=${cursor}&page_size=100` : "?page_size=100";
 			const data = await this.call("GET", `/blocks/${pageId}/children${qs}`);
-			for (const block of data.results ?? []) {
-				if (block.type === "paragraph") {
-					const text = (block.paragraph?.rich_text ?? [])
-						.map((rt: any) => rt.plain_text ?? "")
-						.join("");
-					paragraphs.push(text);
-				}
-			}
+			blocks.push(...(data.results ?? []));
 			cursor = data.has_more ? data.next_cursor : undefined;
 		} while (cursor);
-		return paragraphs.join("\n\n");
-	}
-
-	private paragraphBlocks(text: string) {
-		return splitParagraphs(text).map((p) => ({
-			object: "block",
-			type: "paragraph",
-			paragraph: { rich_text: chunkRichText(p) },
-		}));
+		return blocksToMarkdown(blocks);
 	}
 
 	async createPage(parentPageId: string, title: string, body: string): Promise<string> {
@@ -158,9 +404,23 @@ class NotionClient {
 			properties: {
 				title: { title: [{ type: "text", text: { content: title } }] },
 			},
-			children: this.paragraphBlocks(body),
+			// Notion APIは1回のページ作成で渡せる子ブロック数に上限があるため、
+			// 最初の100件だけ渡し、残りはupdatePageContent同様に追加で送る。
+			children: bodyToNotionBlocks(body).slice(0, 100),
 		});
+		const remaining = bodyToNotionBlocks(body).slice(100);
+		if (remaining.length > 0) {
+			await this.appendBlocks(data.id, remaining);
+		}
 		return data.id;
+	}
+
+	private async appendBlocks(pageId: string, blocks: Record<string, unknown>[]): Promise<void> {
+		for (let i = 0; i < blocks.length; i += 100) {
+			await this.call("PATCH", `/blocks/${pageId}/children`, {
+				children: blocks.slice(i, i + 100),
+			});
+		}
 	}
 
 	async updatePageContent(pageId: string, title: string, body: string): Promise<void> {
@@ -177,9 +437,9 @@ class NotionClient {
 		for (const block of existing.results ?? []) {
 			await this.call("DELETE", `/blocks/${block.id}`);
 		}
-		const blocks = this.paragraphBlocks(body);
+		const blocks = bodyToNotionBlocks(body);
 		if (blocks.length > 0) {
-			await this.call("PATCH", `/blocks/${pageId}/children`, { children: blocks });
+			await this.appendBlocks(pageId, blocks);
 		}
 	}
 }
@@ -351,7 +611,7 @@ export default class NotionMemoPlugin extends Plugin {
 			const lastEdited: string = page.last_edited_time ?? "";
 
 			if (!local) {
-				const body = await client.getPageParagraphs(child.id);
+				const body = await client.getPageMarkdown(child.id);
 				const hash = hashString(body);
 				const filename = `${sanitizeFilename(child.title)}.md`;
 				const newFile = await this.app.vault.create(filename, body);
@@ -369,7 +629,7 @@ export default class NotionMemoPlugin extends Plugin {
 			const pulledAt = localCache?.[FRONTMATTER_PULLED_AT_KEY];
 			if (pulledAt && pulledAt >= lastEdited) continue; // ローカルの方が新しいか同じ
 
-			const body = await client.getPageParagraphs(child.id);
+			const body = await client.getPageMarkdown(child.id);
 			const hash = hashString(body);
 			if (localCache?.[FRONTMATTER_HASH_KEY] === hash) continue; // 中身は同じ
 
