@@ -579,21 +579,10 @@ export default class NotionMemoPlugin extends Plugin {
 			});
 			new Notice(`Notionへ新規作成: ${file.basename}`);
 		} else {
-			// 競合検知：前回同期時点からNotion側が別に変わっていないか確認する。
-			// 確認せず上書きすると、Notion側での直接編集がここで消える
-			// （このメモがまさに踏んだ不具合）。
-			const knownHash = fm?.[FRONTMATTER_HASH_KEY];
-			if (knownHash) {
-				const remoteBody = await client.getPageMarkdown(notionId);
-				const remoteHash = hashString(remoteBody);
-				if (remoteHash !== knownHash) {
-					new Notice(
-						`Notion側が別に更新されているため送信を中止: ${file.basename}` +
-							"（先に「Notionから同期する」を実行してください）"
-					);
-					return;
-				}
-			}
+			// 方針：Obsidianを常に正とする。Notion側が別に変わっていても
+			// 確認せず上書きする（本人の指定、2026-08-01）。
+			// ローカルを守る側（pull側）にだけ、未送信のローカル編集を
+			// 上書きしない保護を残す。
 			await client.updatePageContent(notionId, file.basename, body);
 			await this.app.fileManager.processFrontMatter(file, (data) => {
 				data[FRONTMATTER_HASH_KEY] = hash;
